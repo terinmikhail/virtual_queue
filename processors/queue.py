@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import logging
 import signal
 import sys
 from dataclasses import asdict
@@ -10,7 +11,8 @@ from confluent_kafka import Consumer, Producer
 
 from core.apply_telemetry import apply_telemetry
 from core.build_queue import build_queue, handle_event
-from core.models import StationState, UnitState
+from core.config import GeoPoint
+from core.models import StationState, UnitState, UnitStatus
 
 
 def _iso(ts: int) -> str:
@@ -31,7 +33,9 @@ class P2QueueProcessor:
         in_topic: str = "station_events.v1",
         queue_topic: str = "queue.v1",
         station_q_topic: str = "station_q.v1",
+        units_state_topic: str = "units_state.v1"
     ):
+        self.log = logging.getLogger("queue")
         self.in_topic = in_topic
         self.queue_topic = queue_topic
         self.station_q_topic = station_q_topic
@@ -42,13 +46,13 @@ class P2QueueProcessor:
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
         })
-        self.telemetry_consumer = Consumer({
+        self.units_consumer = Consumer({
             "bootstrap.servers": bootstrap,
-            "group.id": "p2-units",
+            "group.id": "p2-units-state",
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
         })
-        self.telemetry_consumer.subscribe(["telemetry.v1"])
+        self.units_consumer.subscribe([units_state_topic])
         self.producer = Producer({"bootstrap.servers": bootstrap})
 
         self.state: dict[str, StationState] = {}
@@ -63,11 +67,15 @@ class P2QueueProcessor:
         try:
             while self.running:
                 # 1. telemetry -> units
-                tmsg = self.telemetry_consumer.poll(0)
-                if tmsg is not None and not tmsg.error():
-                    self._handle_telemetry(tmsg)
-                    self.telemetry_consumer.commit(message=tmsg)
-
+                max_batch = 100
+                count = 0
+                while count < max_batch:
+                    umsg = self.units_consumer.poll(0)
+                    if umsg is None or umsg.error():
+                        break
+                    self._handle_units_state(umsg)
+                    self.units_consumer.commit(message=umsg)
+                    count += 1
                 # 2. station_events -> очередь
                 msg = self.consumer.poll(0.5)
                 if msg is None:
@@ -78,7 +86,7 @@ class P2QueueProcessor:
                 self._handle(msg)
         finally:
             self.consumer.close()
-            self.telemetry_consumer.close()
+            self.units_consumer.close()
             self.producer.flush()
             print("P2 stopped.")
 
@@ -102,7 +110,7 @@ class P2QueueProcessor:
         station = handle_event(station, event, self.units, self.now_ts)
 
         # 2. построить очередь (твоя build_queue)
-        new_queue = build_queue(station, self.units, self.now_ts)
+        new_queue = build_queue(station, self.units, self.now_ts, log=self.log)
 
         # 3. дедуп: публиковать только если изменилось
         new_hash = hash_queue(new_queue)
@@ -114,16 +122,24 @@ class P2QueueProcessor:
         self.state[station_uuid] = station
         self.consumer.commit(message=kafka_msg)
 
-    def _handle_telemetry(self, kafka_msg):
+    def _handle_units_state(self, kafka_msg) -> None:
         try:
-            payload = json.loads(kafka_msg.value())
-        except json.JSONDecodeError as e:
-            print(f"Bad telemetry JSON: {e}", file=sys.stderr)
+            data = json.loads(kafka_msg.value())
+        except json.JSONDecodeError:
             return
-        unit_uuid = payload["unit_uuid"]
-        prev = self.units.get(unit_uuid)
-        new_state, _ = apply_telemetry(prev, payload)
-        self.units[unit_uuid] = new_state
+        for uuid, state_data in data.items():
+            self.units[uuid] = UnitState(
+                unit_uuid=state_data["unit_uuid"],
+                last_ts=state_data["last_ts"],
+                point=GeoPoint(state_data["point"]["lat"], state_data["point"]["lon"]),
+                speed_kmh=state_data["speed_kmh"],
+                status=UnitStatus(state_data["status"]),
+                target_station=state_data["target_station"],
+                home_station=state_data["home_station"],
+                decision_made_this_trip=state_data["decision_made_this_trip"],
+                last_decision_ts=state_data["last_decision_ts"],
+                entered_station_radius_ts=state_data["entered_station_radius_ts"],
+            )
 
     def _publish(self, station: StationState, queue: list) -> None:
         payload = json.dumps({
@@ -141,6 +157,11 @@ class P2QueueProcessor:
 
 
 def main():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     ap = argparse.ArgumentParser()
     ap.add_argument("--bootstrap", default="localhost:9092")
     args = ap.parse_args()

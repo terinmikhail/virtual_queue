@@ -44,6 +44,11 @@ def is_point_inside_any_station(p: GeoPoint, station_uuid: str, margin_m: float 
     return within_radius(p, st.point, STATION_RADIUS_M + margin_m)
 
 
+def is_point_inside_any_load(p: GeoPoint, margin_m: float = 0.0) -> bool:
+    up = UNLOAD_POINT
+    return within_radius(p, up, UNLOAD_RADIUS_M + margin_m)
+
+
 def point_on_station_boundary_facing_unload(station_uuid: str) -> GeoPoint:
     """Точка на границе радиуса станции (50 м), со стороны разгрузки."""
     st = STATIONS_BY_UUID[station_uuid]
@@ -54,7 +59,7 @@ def point_on_station_boundary_facing_unload(station_uuid: str) -> GeoPoint:
     if total == 0:
         return GeoPoint(st.point.lat + STATION_RADIUS_M / 111_320.0, st.point.lon)
     # сдвиг на 50 м в сторону разгрузки
-    ratio = (STATION_RADIUS_M / 111_320.0) / total
+    ratio = ((STATION_RADIUS_M+1) / 111_320.0) / total
     return GeoPoint(
         st.point.lat + dlat * ratio,
         st.point.lon + dlon * ratio,

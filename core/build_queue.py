@@ -1,3 +1,5 @@
+import logging
+
 from core.config import QUEUE_HORIZON_SECONDS, OCCUPANCY_SECONDS, FRESHNESS_SECONDS
 from core.func import _eta_to_station
 from core.models import StationState, UnitState, QueueEntry, UnitStatus, UnitEventType
@@ -8,6 +10,7 @@ def build_queue(
     station: StationState,
     units: dict[str, UnitState],
     now: int,
+    log: logging.Logger | None = None
 ) -> list[QueueEntry]:
     """Пересчитать очередь станции на горизонт 30 минут от now.
 
@@ -16,9 +19,14 @@ def build_queue(
     """
     horizon = now + QUEUE_HORIZON_SECONDS
     entries: list[QueueEntry] = []
-
+    if station.uuid == "S1":
+        if log is not None:
+            log.debug(f"Units len - {len(units)}")
     # 1) занявшая станция — первая
     if station.occupied_by is not None:
+        if station.uuid == "S1":
+            if log is not None:
+                log.debug(f"Unit occupied station S1")
         service_start = station.occupied_since
         if service_start is None:
             service_start = station.occupied_until - OCCUPANCY_SECONDS
@@ -51,6 +59,9 @@ def build_queue(
         candidates.append((eta, uuid))
 
     candidates.sort()
+    if station.uuid == "S1":
+        if log is not None:
+            log.debug(f"Candidates queue station: {candidates}")
 
     # 3) выстраиваем по времени приезда
     prev_free = station.occupied_until if station.occupied_by else now
@@ -63,6 +74,9 @@ def build_queue(
             wait_seconds=service_start - eta,
         ))
         prev_free = free_at
+    if station.uuid == "S1":
+        if log is not None:
+            log.debug(f"Final queue station: {entries}")
     return entries
 
 

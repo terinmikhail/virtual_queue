@@ -6,7 +6,7 @@
 
 **Три процессора** (плюс генератор, не процессор).
 
-**Критерий:** «каждый процессор владеет состоянием, которое естественно шардируется по одному ключу». Три разных ключа → три процессора:
+**Критерий:** «каждый процессор владеет состоянием, которое естественно шардируется по одному ключу».
 - **P1 (Telemetry)** — состояние **per-unit** (ключ `unit_uuid`): нормализация телеметрии, детекция переходов.
 - **P2 (Queue)** — состояние **per-station** (ключ `station_uuid`): занятость станции, очередь.
 - **P3 (Recommender)** — решение **per-unit**, но требует **всех** станций (broadcast): выбор станции.
@@ -17,11 +17,11 @@
 
 | Процессор | Ключ | Партиции | Состояние |
 |---|---|---|---|
-| **P1** | `unit_uuid` | 8 | `UnitState`: `last_ts`, `point`, `speed_kmh`, `status` (`AT_STATION`/`TO_UNLOAD`/`TO_STATION`), `target_station`, `home_station`, `decision_made_this_trip`, `entered_station_radius_ts` |
-| **P2** | `station_uuid` | 4 | `StationState`: `occupied_by`, `occupied_since`, `occupied_until`, `queue` (список `QueueEntry`), `last_published_hash` |
+| **P1** | `unit_uuid` | 8 | `UnitState`: `last_ts`, `point`, `speed_kmh`, `status`, `target_station`, `home_station`, `decision_made_this_trip`, `entered_station_radius_ts` |
+| **P2** | `station_uuid` | 4 | `StationState`: `occupied_by`, `occupied_since`, `occupied_until`, `queue`, `last_published_hash` |
 | **P3** | `unit_uuid` | 8 | `units`: `dict[unit_uuid → UnitState]`; `stations`: `dict[station_uuid → StationState]` (из broadcast-снимков) |
 
-**State store:** in-memory `dict` + компактированный changelog-топик (`state.<processor>.changelog`) для восстановления. Для 40 машин восстановление — секунды. В проде — RocksDB + changelog (как в Kafka Streams).
+**State store:** in-memory `dict` + компактированный changelog-топик для восстановления. Для 40 машин — секунды. В проде — RocksDB + changelog (как в Kafka Streams).
 
 ## 3. Конфликт «машина vs станция» — как разрешён
 
@@ -31,11 +31,13 @@
 1. **P1** эмитит каждое событие в **два** топика:
    - `unit_events.v1` (ключ `unit_uuid`) → для P3;
    - `station_events.v1` (ключ `station_uuid`) → для P2.
-2. **P2** публикует снимок очереди в `station_q.v1` (ключ `station_uuid`, **compacted**).
-3. **P3** читает:
+2. **P1** публикует **снимок** `UnitState` всех 40 машин **раз в секунду** в `units_state.v1` (ключ `"all"`, compacted). **P2 и P3 читают этот снимок** — **не** вызывают `apply_telemetry` сами (нет дублирования логики и рассинхронизации).
+3. **P2** публикует снимок очереди в `station_q.v1` (ключ `station_uuid`, **compacted**).
+4. **P3** читает:
    - свои `unit_events.v1` (по партициям своего ключа);
-   - **broadcast** `station_q.v1` (**все** партиции, **уникальный** `group.id` на инстанс) — глобальная картина всех станций.
-4. **P3** также читает `telemetry.v1` (своя группа `p3-units`) для `UnitState` (нужен для `decide`: позиция, `status`, `home`).
+   - **broadcast** `station_q.v1` (**все** партиции, **уникальный** `group.id` на инстанс);
+   - `units_state.v1` (своя группа) для `UnitState`.
+5. **P3** после `decide` (если RECOMMENDED) публикует `decision.v1` (рекомендация). **P1 и симулятор** читают `decision.v1` и **меняют** `target_station` у машины.
 
 **Broadcast** — ключевой приём: топик станций **маленький** (4 записи), его можно реплицировать во все инстансы P3.
 
@@ -48,6 +50,7 @@
 | `station_events.v1` | 4 | 3 / 1 | ≤ 4 инстансов P2 |
 | `queue.v1` | 4 | 3 / 1 | — |
 | `station_q.v1` | 4 | 3 / 1 (compacted) | broadcast → не ограничивает P3 |
+| `units_state.v1` | 8 | 3 / 1 (compacted) | ≤ 8 (своя группа P2/P3) |
 | `decision.v1` | 8 | 3 / 1 | — |
 
 - **P1:** ≤ 8 инстансов (по партициям `telemetry.v1`).
@@ -61,9 +64,28 @@
 | Топик | Гарантия | Как |
 |---|---|---|
 | `telemetry.v1` | at-least-once | consumer manual commit (после обработки) |
-| `unit_events`/`station_events` | at-least-once + идемпотентность | правило `ts <= last_ts` отсекает дубли; state обновляется детерминированно |
-| `queue.v1` | идемпотентность достаточно | дедуп по `last_published_hash`; повторная публикация того же снимка безвредна |
-| `decision.v1` | **exactly-once желательно** | Kafka transactions (state.put + producer.send + offset.commit); иначе идемпотентность по `(unit_uuid, trip_id)` |
+| `unit_events`/`station_events` | at-least-once + идемпотентность | правило `ts <= last_ts` отсекает дубли |
+| `units_state.v1` | идемпотентность | снимок, повторная публикация безвредна |
+| `queue.v1` | идемпотентность достаточно | дедуп по `last_published_hash` |
+| `decision.v1` | **exactly-once желательно** | Kafka transactions (state + producer + offset.commit); иначе идемпотентность по `(unit_uuid, trip_id)` |
 
 **Где транзакции обязательны:** P3 (`decision.v1` — решение не должно дублироваться за заезд).
 **Где достаточно идемпотентности:** P2 (`queue.v1` — снимок, повтор безвреден).
+
+## 6. Рестарт
+
+- **State store:** in-memory `dict` + компактированный changelog. При старте инстанс читает changelog, восстанавливает `dict`, затем продолжает с закоммиченного offset.
+- **Время восстановления:** секунды (40 машин, 4 станции).
+- **Повторное проигрывание:** правило `ts <= last_ts` → дубли игнорируются; state не ломается. `decision_made_this_trip`/`last_decision_ts` защищают от повторных решений. При полной потере state — решения пересчитаются **детерминированно** (event-time).
+- **«Сейчас»** = max `ts` учтённых сообщений, восстанавливается из changelog/реплея детерминированно.
+
+## 7. Что сознательно не вынесли в отдельный процессор
+
+- **Парсинг/валидацию JSON** — в обвязке каждого процессора.
+- **Генератор телеметрии** — отдельное приложение, не процессор (эмулятор).
+- **Создание топиков** — одноразовый `init-topics`.
+- **Свежесть/expiry** — таймеры в P2 (event-time).
+- **Метрики (Prometheus)** — опционально.
+- **Рекомендации в генераторе** — генератор **читает** `decision.v1` и меняет `target_station` (машина меняет маршрут).
+
+## Схема потоков

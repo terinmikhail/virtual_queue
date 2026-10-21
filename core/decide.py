@@ -1,3 +1,5 @@
+import logging
+
 from core.config import MIN_GAIN_SECONDS, FRESHNESS_SECONDS
 from core.func import _wait_at_station, _closer
 from core.models import UnitState, Decision, StationState, DecisionResult, RejectReason
@@ -8,6 +10,7 @@ def decide(
     stations: dict[str, StationState],
     now: int,
     event_ts: int,
+    log: logging.Logger | None = None
 ) -> Decision:
     """Сравнить ожидание у всех станций, вернуть решение."""
     if now - event_ts > FRESHNESS_SECONDS:
@@ -17,18 +20,30 @@ def decide(
             result=DecisionResult.REJECTED,
             reason=RejectReason.STALE_TELEMETRY,
         )
+    if unit.unit_uuid == "T-01":
+        if log is not None:
+            log.debug(f"Come event about {unit}")
+
     home = unit.home_station
     home_wait = _wait_at_station(unit, stations[home], now)
     best_uuid, best_wait = home, home_wait
-
+    if unit.unit_uuid == "T-01":
+        if log is not None:
+            log.debug(f"Home wait = {home_wait}")
     for st_uuid, st in stations.items():
         if st_uuid == home:
             continue
         w = _wait_at_station(unit, st, now)
         if w < best_wait or (w == best_wait and _closer(unit, st_uuid, best_uuid)):
             best_uuid, best_wait = st_uuid, w
+            if unit.unit_uuid == "T-01":
+                if log is not None:
+                    log.debug(f"New Best wait = {best_wait}")
 
     gain = home_wait - best_wait
+    if unit.unit_uuid == "T-01":
+        if log is not None:
+            log.debug(f"Gain = {gain}")
     if best_uuid == home or gain < MIN_GAIN_SECONDS:
         return Decision(unit.unit_uuid,
                         now, DecisionResult.REJECTED,

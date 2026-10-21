@@ -10,6 +10,7 @@ TOPICS = {
     "queue.v1":           (4, 1, {}),
     "station_q.v1":       (4, 1, {"cleanup.policy": "compact"}),
     "decision.v1":        (8, 1, {}),
+    "units_state.v1":     (8, 1, {"cleanup.policy": "compact"}),
 }
 
 

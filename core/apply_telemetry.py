@@ -1,3 +1,5 @@
+import logging
+
 from core.config import GeoPoint, UNIT_HOME_STATION, DECISION_RADIUS_M, STATIONS_BY_UUID, STATION_RADIUS_M, \
     STANDING_SPEED_KMH, UNLOAD_POINT, UNLOAD_RADIUS_M
 from core.geo import distance_m, within_radius
@@ -8,12 +10,15 @@ from core.models import UnitState, UnitEvent, UnitStatus, UnitEventType
 def apply_telemetry(
     prev: UnitState | None,
     msg: dict,
+    log: logging.Logger | None = None,
 ) -> tuple[UnitState, list[UnitEvent]]:
     ts = int(msg["ts"])
     point = GeoPoint(msg["lat"], msg["lon"])
     speed = float(msg["speed_kmh"])
     unit_uuid = msg["unit_uuid"]
-
+    if unit_uuid == "T-01":
+        if log is not None:
+            log.debug(f"New msg for unit: {msg}")
     # 1) порядок/дубли
     if prev is not None and ts <= prev.last_ts:
         return prev, []
@@ -29,18 +34,22 @@ def apply_telemetry(
     # определить статус по правилам ТЗ
     station_point = STATIONS_BY_UUID[target].point
     near_station = within_radius(point, station_point, STATION_RADIUS_M)
+    prev_distance_unload = 0
+    if prev:
+        prev_distance_unload = distance_m(UNLOAD_POINT, prev.point)
+    now_distance_unload = distance_m(UNLOAD_POINT, point)
     standing = speed < STANDING_SPEED_KMH
     entered_radius_ts = prev.entered_station_radius_ts if prev else None
     if near_station and standing:
         new_status = UnitStatus.AT_STATION
-    elif prev is not None and prev.status == UnitStatus.AT_STATION and not near_station:
+    elif prev is not None and prev.status == UnitStatus.AT_STATION and not near_station and speed != 0:
         new_status = UnitStatus.TO_UNLOAD
         entered_radius_ts = None
         events.append(UnitEvent(msg["unit_uuid"], ts, UnitEventType.LEFT_STATION, target))
     elif prev is not None and prev.status == UnitStatus.TO_UNLOAD and within_radius(point, UNLOAD_POINT, UNLOAD_RADIUS_M):
         # вошла в радиус разгрузки — пока ничего не эмитим, ждём выхода
         new_status = UnitStatus.TO_UNLOAD
-    elif prev is not None and prev.status == UnitStatus.TO_UNLOAD and not within_radius(point, UNLOAD_POINT, UNLOAD_RADIUS_M):
+    elif prev is not None and prev.status == UnitStatus.TO_UNLOAD and not within_radius(point, UNLOAD_POINT, UNLOAD_RADIUS_M) and prev_distance_unload < now_distance_unload:
         new_status = UnitStatus.TO_STATION
         target = home
         events.append(UnitEvent(msg["unit_uuid"], ts, UnitEventType.LEFT_UNLOAD, target))
@@ -66,7 +75,12 @@ def apply_telemetry(
     if new_status == UnitStatus.AT_STATION:
         decision_made = False
         last_decision_ts = None
-
+    if unit_uuid == "T-01":
+        if log is not None:
+            log.debug(f"Update state: last_ts = {ts}, point = {point}, speed = {speed},"
+                      f"status = {new_status}, target_station = {target}, home_station = {home},"
+                      f"decision_made_this_trip = {decision_made}, last_decision_ts = {last_decision_ts},"
+                      f"entered_station_radius_ts = {entered_radius_ts}")
     new_state = UnitState(
         unit_uuid=unit_uuid, last_ts=ts, point=point, speed_kmh=speed,
         status=new_status, target_station=target, home_station=home,

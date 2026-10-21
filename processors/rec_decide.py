@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import signal
 import sys
 from datetime import datetime, timezone
@@ -9,11 +10,11 @@ from datetime import datetime, timezone
 from confluent_kafka import Consumer, Producer
 
 from core.apply_telemetry import apply_telemetry
-from core.config import STATIONS
+from core.config import STATIONS, GeoPoint
 from core.decide import decide
 from core.models import (
     Decision, DecisionResult, QueueEntry,
-    StationState, UnitEventType, UnitState,
+    StationState, UnitEventType, UnitState, UnitStatus,
 )
 
 
@@ -68,6 +69,7 @@ class P3Recommender:
         decision_topic: str = "decision.v1",
         station_snapshot_group_id: str | None = None,
     ):
+        self.log = logging.getLogger("decide")
         self.unit_events_topic = unit_events_topic
         self.station_q_topic = station_q_topic
         self.decision_topic = decision_topic
@@ -91,13 +93,13 @@ class P3Recommender:
             "auto.offset.reset": "latest",
             "enable.auto.commit": False,
         })
-        self.telemetry_consumer = Consumer({
+        self.units_consumer = Consumer({
             "bootstrap.servers": bootstrap,
-            "group.id": "p3-units",
+            "group.id": "p3-units-state",
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
         })
-        self.telemetry_consumer.subscribe(["telemetry.v1"])
+        self.units_consumer.subscribe(["units_state.v1"])
 
         self.producer = Producer({"bootstrap.servers": bootstrap})
 
@@ -118,11 +120,15 @@ class P3Recommender:
         try:
             while self.running:
                 # 1. telemetry -> units
-                tmsg = self.telemetry_consumer.poll(0)
-                if tmsg is not None and not tmsg.error():
-                    self._handle_telemetry(tmsg)
-                    self.telemetry_consumer.commit(message=tmsg)
-
+                max_batch = 100
+                count = 0
+                while count < max_batch:
+                    umsg = self.units_consumer.poll(0)
+                    if umsg is None or umsg.error():
+                        break
+                    self._handle_units_state(umsg)
+                    self.units_consumer.commit(message=umsg)
+                    count += 1
                 # 2. снимки станций
                 smsg = self.stations_consumer.poll(0)
                 if smsg is not None and not smsg.error():
@@ -139,7 +145,7 @@ class P3Recommender:
                 self._handle_event(emsg)
         finally:
             self.events_consumer.close()
-            self.telemetry_consumer.close()
+            self.units_consumer.close()
             self.stations_consumer.close()
             self.producer.flush()
             print("P3 stopped.")
@@ -151,16 +157,29 @@ class P3Recommender:
         except Exception as e:
             print(f"Bad station snapshot: {e}", file=sys.stderr)
 
-    def _handle_telemetry(self, kafka_msg):
+    def _handle_units_state(self, kafka_msg):
         try:
-            payload = json.loads(kafka_msg.value())
-        except json.JSONDecodeError as e:
-            print(f"Bad telemetry JSON: {e}", file=sys.stderr)
+            data = json.loads(kafka_msg.value())
+        except json.JSONDecodeError:
             return
-        unit_uuid = payload["unit_uuid"]
-        prev = self.units.get(unit_uuid)
-        new_state, _ = apply_telemetry(prev, payload)
-        self.units[unit_uuid] = new_state
+
+        # пропускаем старые (по одной машине)
+        if "unit_uuid" in data:
+            return
+
+        for uuid, state_data in data.items():
+            self.units[uuid] = UnitState(
+                unit_uuid=state_data["unit_uuid"],
+                last_ts=state_data["last_ts"],
+                point=GeoPoint(state_data["point"]["lat"], state_data["point"]["lon"]),
+                speed_kmh=state_data["speed_kmh"],
+                status=UnitStatus(state_data["status"]),
+                target_station=state_data["target_station"],
+                home_station=state_data["home_station"],
+                decision_made_this_trip=state_data["decision_made_this_trip"],
+                last_decision_ts=state_data["last_decision_ts"],
+                entered_station_radius_ts=state_data["entered_station_radius_ts"],
+            )
 
     def _handle_event(self, kafka_msg) -> None:
         try:
@@ -187,8 +206,9 @@ class P3Recommender:
             return
 
         # ядро: решение
-        decision = decide(unit, self.stations, self.now_ts, event_ts=ts)
-
+        decision = decide(unit, self.stations, self.now_ts, event_ts=ts, log=self.log)
+        if decision.unit_uuid == "T-01":
+            self.log.debug(f"Decision = {decision.result}, station = {decision.to_station}")
         # публикация
         self._publish_decision(decision)
 
@@ -208,6 +228,11 @@ class P3Recommender:
 
 
 def main():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     ap = argparse.ArgumentParser()
     ap.add_argument("--bootstrap", default="localhost:9092")
     args = ap.parse_args()
